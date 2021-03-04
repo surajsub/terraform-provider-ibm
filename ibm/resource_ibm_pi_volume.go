@@ -11,6 +11,8 @@ package ibm
 
 import (
 	"fmt"
+	"github.com/IBM-Cloud/power-go-client/power/client/p_cloud_volumes"
+	"github.com/IBM-Cloud/power-go-client/power/models"
 	"log"
 	"strings"
 	"time"
@@ -47,12 +49,6 @@ func resourceIBMPIVolume() *schema.Resource {
 
 		Schema: map[string]*schema.Schema{
 
-			"volume_id": {
-				Type:        schema.TypeString,
-				Computed:    true,
-				Description: "Volume ID",
-			},
-
 			helpers.PIVolumeName: {
 				Type:        schema.TypeString,
 				Required:    true,
@@ -72,7 +68,7 @@ func resourceIBMPIVolume() *schema.Resource {
 			helpers.PIVolumeType: {
 				Type:         schema.TypeString,
 				Required:     true,
-				ValidateFunc: validateAllowedStringValue([]string{"ssd", "standard", "tier1", "tier3"}),
+				ValidateFunc: validateAllowedStringValue([]string{"tier1", "tier3"}),
 				Description:  "Volume type",
 			},
 
@@ -82,7 +78,40 @@ func resourceIBMPIVolume() *schema.Resource {
 				Description: " Cloud Instance ID - This is the service_instance_id.",
 			},
 
+			helpers.PIInstanceName: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Instance Name to preserve the Volume Affinity",
+				//ConflictsWith: []string{"affinity_volume"},
+			},
+
+			"volume_count": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Default:     1,
+				Description: "Count of the volumes: Note - Every volume will be of the same size",
+			},
+
+			helpers.PIAffinityVolume: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Volume id that we need affinity to",
+				//ConflictsWith: []string{helpers.PIInstanceName},
+			},
+
+			helpers.PIAffinityPolicy: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Volume Affinity",
+			},
+
 			// Computed Attributes
+
+			"volume_id": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "Volume ID",
+			},
 
 			"volume_status": {
 				Type:        schema.TypeString,
@@ -100,6 +129,11 @@ func resourceIBMPIVolume() *schema.Resource {
 				Computed:    true,
 				Description: "WWN Of the volume",
 			},
+			"pool_volume_type": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "Volume Type-Represents the pool",
+			},
 		},
 	}
 }
@@ -110,24 +144,86 @@ func resourceIBMPIVolumeCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
+	var (
+		instanceid      string
+		affinity_volume string
+		affinity_policy string
+		volume_count    int
+	)
+
 	name := d.Get(helpers.PIVolumeName).(string)
 	volType := d.Get(helpers.PIVolumeType).(string)
-	size := float64(d.Get(helpers.PIVolumeSize).(float64))
+	size := int64(d.Get(helpers.PIVolumeSize).(float64))
+	powerinstanceid := d.Get(helpers.PICloudInstanceId).(string)
+
+	log.Printf("instance name is %s and policy is %s", d.Get(helpers.PIInstanceName), d.Get(helpers.PIAffinityPolicy))
+
+	if d.Get(helpers.PIInstanceName) != "" && d.Get(helpers.PIAffinityPolicy) == "" {
+		return fmt.Errorf("if hostname is provided, the affinity policy also should be provided")
+	}
+
 	var shared bool
 	if v, ok := d.GetOk(helpers.PIVolumeShareable); ok {
 		shared = v.(bool)
 	}
-	powerinstanceid := d.Get(helpers.PICloudInstanceId).(string)
+
+	if v, ok := d.GetOk("volume_count"); ok {
+		volume_count = v.(int)
+	}
+	if v, ok := d.GetOk(helpers.PIInstanceName); ok {
+		instanceid = v.(string)
+	}
+	if v, ok := d.GetOk("affinity_volume"); ok {
+		affinity_volume = v.(string)
+	}
+
+	if v, ok := d.GetOk(helpers.PIAffinityPolicy); ok {
+		affinity_policy = v.(string)
+	}
 
 	client := st.NewIBMPIVolumeClient(sess, powerinstanceid)
-	vol, err := client.Create(name, size, volType, shared, powerinstanceid, volPostTimeOut)
+
+	vol2body := &models.MultiVolumesCreate{
+		AffinityPVMInstance: &instanceid,
+		AffinityPolicy:      nil,
+		AffinityVolume:      nil,
+		DiskType:            volType,
+		Name:                &name,
+		Shareable:           &shared,
+		Size:                &size,
+		VolumePool:          "",
+	}
+
+	if volume_count > 1 {
+		vol2body.Count = int64(volume_count)
+	} else {
+		vol2body.Count = 1
+	}
+
+	if instanceid != "" {
+		vol2body.AffinityPVMInstance = &instanceid
+	}
+	if affinity_volume != "" {
+		vol2body.AffinityVolume = &affinity_volume
+	}
+
+	if affinity_policy != "" {
+		vol2body.AffinityPolicy = &affinity_policy
+		vol2body.AffinityPVMInstance = &instanceid
+	}
+
+	vol2, err := client.CreateVolumeV2(&p_cloud_volumes.PcloudV2VolumesPostParams{
+		Body: vol2body,
+	}, powerinstanceid, helpers.PICreateTimeOut)
+	//vol, err := client.Create(name, size, volType, shared, powerinstanceid, volPostTimeOut)
+
 	if err != nil {
 		return fmt.Errorf("Failed to Create the volume %v", err)
 	}
 
-	volumeid := *vol.VolumeID
-	d.SetId(fmt.Sprintf("%s/%s", powerinstanceid, volumeid))
+	volumeid := *vol2.Volumes[0].VolumeID
 
+	d.SetId(fmt.Sprintf("%s/%s", powerinstanceid, volumeid))
 	_, err = isWaitForIBMPIVolumeAvailable(client, volumeid, powerinstanceid, d.Timeout(schema.TimeoutCreate))
 	if err != nil {
 		return err
@@ -167,6 +263,10 @@ func resourceIBMPIVolumeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	if &vol.Wwn != nil {
 		d.Set("wwn", vol.Wwn)
+	}
+
+	if &vol.VolumeType != nil {
+		d.Set("pool_volume_type", vol.VolumeType)
 	}
 	d.Set(helpers.PICloudInstanceId, powerinstanceid)
 
